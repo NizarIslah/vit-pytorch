@@ -36,6 +36,54 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+class NoisyTopK(nn.Module):
+    def __init__(self, k, sigma):
+        super().__init__()
+        self.k = k
+        self.sigma = sigma
+
+    def forward(self, gate_out):
+        """
+        gate_out: shape: (b, e)
+        """
+        noise = torch.randn_like(gate_out, device='cuda') * self.sigma
+        gate_out = gate_out + noise
+        topk = torch.topk(gate_out, self.k, dim = -1)[0] # shape: b, k
+        # Multiply all but the top k by 0
+        mask = torch.zeros_like(gate_out, device='cuda')
+        mask.scatter_(1, torch.topk(gate_out, self.k, dim = -1)[1], 1) # shape: b, e. it should be 1 in the top k positions
+        gate_out = gate_out * mask
+        return gate_out
+
+class ModuleListWrapper(nn.ModuleList):
+    def forward(self, x):
+        return [module(x) for module in self]
+
+class MoE_MLP(nn.Module):
+    def __init__(self, input_dim, out_dim, num_experts, k, sigma=None):
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts = ModuleListWrapper([FeedForward(input_dim, out_dim) for _ in range(num_experts)])
+        self.gate = nn.Linear(input_dim, num_experts, bias=False)
+        if sigma is None:
+            sigma = 1. / num_experts
+        self.noisy_topk = NoisyTopK(k, sigma)
+
+
+    def forward(self, h):
+        """
+        h: shape: (b, i)
+        """
+        expert_outs = rearrange(self.experts(h), 'e b o -> e b o') # shape (e, b, o)
+        expert_outs = rearrange(expert_outs, 'e b o -> (e b) o')
+        gate_out = self.gate(h) # shape (b, e)
+        gate_out = torch.softmax(gate_out, dim = -1) # shape (b, e)
+        gate_out = self.noisy_topk(gate_out) # shape (b, e)
+        gate_out = rearrange(gate_out, 'b e -> e b')
+        gate_out = gate_out.unsqueeze(-1) # shape (e, b, 1)
+        out = torch.sum(gate_out * expert_outs, dim = 0) # shape (b, o)
+        return out
+
 class Attention(nn.Module):
     def __init__(self, dim, heads = 8, dim_head = 64):
         super().__init__()
@@ -95,6 +143,58 @@ class SimpleViT(nn.Module):
         )
 
         self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim)
+
+        self.to_latent = nn.Identity()
+        self.linear_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+
+    def forward(self, img):
+        *_, h, w, dtype = *img.shape, img.dtype
+
+        x = self.to_patch_embedding(img)
+        pe = posemb_sincos_2d(x)
+        x = rearrange(x, 'b ... d -> b (...) d') + pe
+
+        x = self.transformer(x)
+        x = x.mean(dim = 1)
+
+        x = self.to_latent(x)
+        return self.linear_head(x)
+
+class MoETransformer(nn.Module):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, num_experts = 4, k = 2):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                Attention(dim, heads = heads, dim_head = dim_head),
+                MoE_MLP(dim, mlp_dim, num_experts, k)
+            ]))
+    def forward(self, x):
+        for attn, ff in self.layers:
+            x = attn(x) + x
+            x = ff(x) + x
+        return x
+
+class SimpleMoEViT(nn.Module):
+    def __init__(self, *, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels = 3, dim_head = 64, num_experts = 4, k = 2):
+        super().__init__()
+        image_height, image_width = pair(image_size)
+        patch_height, patch_width = pair(patch_size)
+
+        assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
+
+        num_patches = (image_height // patch_height) * (image_width // patch_width)
+        patch_dim = channels * patch_height * patch_width
+
+        self.to_patch_embedding = nn.Sequential(
+            Rearrange('b c (h p1) (w p2) -> b h w (p1 p2 c)', p1 = patch_height, p2 = patch_width),
+            nn.Linear(patch_dim, dim),
+        )
+
+        self.transformer = MoETransformer(dim, depth, heads, dim_head, mlp_dim, num_experts, k)
 
         self.to_latent = nn.Identity()
         self.linear_head = nn.Sequential(
